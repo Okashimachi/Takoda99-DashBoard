@@ -85,7 +85,7 @@
     setConn('connecting'); showEmpty('サーバーに接続しています…');
     try { ws = new WebSocket(url); } catch { scheduleReconnect('接続に失敗しました'); return; }
 
-    ws.onopen = () => { setConn('open'); hideBanner(); backoff = 1000; };
+    ws.onopen = () => { setConn('open'); hideBanner(); backoff = 1000; armIdle(); };
     ws.onmessage = (ev) => { let env; try { env = JSON.parse(ev.data); } catch { return; } handleEnvelope(env); };
     ws.onclose = (e) => {
       setConn('closed');

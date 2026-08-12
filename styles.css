@@ -270,10 +270,16 @@ select:focus, input:focus { border-color: var(--accent); }
 .shop-count .bars i { width: 5px; border-radius: 2px; display: block; }
 .shop-empty { flex: 1; display: flex; align-items: center; justify-content: center; font-size: 10.5px; color: var(--text-faint); }
 
-/* ── 空状態 ── */
-.empty { position: absolute; inset: 18px 22px 40px; display: flex; align-items: center; justify-content: center; pointer-events: none; }
-.empty[hidden] { display: none; }
-.empty-inner { text-align: center; color: var(--text-dim); }
+/* ── 空状態（接続中 / 試合なし）。ビューポート中央に浮くカードとして常に見えるようにする。
+   .content が縦に長い（99店グリッド）ため absolute 中央寄せだと画面外に行くので fixed にする。 */
+.empty { position: fixed; left: 50%; top: 56%; transform: translate(-50%, -50%); z-index: 25; pointer-events: none; }
+.empty-inner {
+  text-align: center; color: var(--text-dim);
+  background: color-mix(in srgb, var(--bg-elev) 94%, transparent);
+  border: 1px solid var(--border); border-radius: 14px;
+  padding: 26px 40px; backdrop-filter: blur(6px);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.4);
+}
 .empty-spinner { width: 34px; height: 34px; margin: 0 auto 14px; border: 3px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .empty-inner p { margin: 0; font-size: 14px; }
