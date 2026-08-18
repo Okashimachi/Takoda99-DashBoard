@@ -1,7 +1,8 @@
 // タコダ99 観測ダッシュボード — 素の JS。
 // サーバーの /admin/ws（読み取り専用の観測ストリーム）を購読し、3タブで盤面を描く。
-//   店舗盤面  : 99店のスコア/順位/行列/提供数/足切り対象圏。
-//   スコア分布: 順位順の縦棒＋カットライン＋Bot色分け＋足切り履歴。
+//   店舗盤面  : 99店のスコア/順位/行列/提供数/足切り対象圏。tier で色分け・人間はハイライト。
+//   スコア分布: 順位順の縦棒（0 基準・負は下向き）＋カットライン＋tier 4色＋tier別集計
+//               ＋heat カーブ（maxLevel の水平線つき）＋足切り履歴。
 //   客フロー  : 待機エリア(restPool)と各店の行列を、客属性(ジャンル)別の四角で可視化。
 //
 // ワイヤ契約（plan-h00 §4 / plan-h02）: /admin/ws は proto.Envelope{type,payload}。
@@ -11,6 +12,12 @@
 //   「当日のトラブル切り分け」→「残り期間でバランスを詰めるための計測器」。
 //   体力・我慢ゲージは廃止され、見るのは **スコア分布と足切りの妥当性**。
 //   分布ビューが無いと h26（バランス検証）が回らない。
+//
+// 🔴 h34 で「調整のフィードバックループを閉じる」ために足したもの:
+//   tier（弱/中/強Bot・人間の4色）/ heat カーブ＋maxLevel 線 / 平均打鍵数 / tier別集計。
+//   heat の履歴は**サーバーに持たせない**（h23「配信の状態は publisher が持つ」）。
+//   スナップショットは1〜2秒間隔で届くので、受信のたびにこちらで積む。
+//   → 履歴は**このページを開いてから**のぶんだけ。試合開始前に開いておくこと。
 'use strict';
 
 (() => {
@@ -27,6 +34,26 @@
   const SHOP_SQUARE_CAP = 8;   // これを超える行列は「人数表示」に切り替える
   const REST_SQUARE_CAP = 160; // 待機エリアに描く四角の上限（超過は比例縮約）
 
+  // Bot の強さ階層（plan-h31 / AdminStore.tier）。人間は tier が空で届く。
+  //
+  // 🔴 **色は「誰か」だけを表す。** 状態（脱落・次に切られる・負スコア）を色で上書きすると、
+  //    tier と状態が混ざって「強 Bot が上位を独占しているか」が読めなくなる。
+  //    状態は 位置（0 の上下）・枠線・彩度 で表す（styles.css 側）。
+  const TIER_ORDER = ['human', 'strong', 'normal', 'weak', 'bot'];
+  const TIER = {
+    human: { label: '人間', short: '人' },
+    strong: { label: '強Bot', short: '強' },
+    normal: { label: '中Bot', short: '中' },
+    weak: { label: '弱Bot', short: '弱' },
+    bot: { label: 'Bot(tier不明)', short: 'B' },
+  };
+  // tier 未配線のサーバー（h31 以前）でも壊れないように、未知の値は 'bot' に寄せる。
+  function tierOf(s) {
+    if (!s.isBot) return 'human';
+    const t = String(s.tier || '');
+    return (t === 'strong' || t === 'normal' || t === 'weak') ? t : 'bot';
+  }
+
   const el = {
     banner: $('banner'), connDot: $('conn-dot'),
     tabs: document.querySelectorAll('.tab'),
@@ -35,7 +62,7 @@
     serverInput: $('server-input'), tokenInput: $('token-input'), connectBtn: $('connect-btn'),
     // metrics
     mAlive: $('m-alive'), mTotal: $('m-total'), mDead: $('m-dead'),
-    mPhase: $('m-phase'), mHeat: $('m-heat'), mRest: $('m-rest'),
+    mPhase: $('m-phase'), mHeat: $('m-heat'), mHeatMax: $('m-heat-max'), mKeys: $('m-keys'), mRest: $('m-rest'),
     mMix: $('m-mix'), mProgress: $('m-progress'), mUpdate: $('m-update'),
     mCullUntil: $('m-cull-until'), mCullStage: $('m-cull-stage'), mCullTotal: $('m-cull-total'),
     // 足切り予告
@@ -44,9 +71,13 @@
     // views
     viewBoard: $('view-board'), viewDist: $('view-dist'), viewFlow: $('view-flow'),
     grid: $('grid'), legend: $('legend'),
-    distBars: $('dist-bars'), distChart: $('dist-chart'), cutline: $('cutline'),
+    distBars: $('dist-bars'), distChart: $('dist-chart'), cutline: $('cutline'), zeroline: $('zeroline'),
     dTop: $('d-top'), dBottom: $('d-bottom'), dSep: $('d-sep'), dBotShare: $('d-botshare'),
     dTopN: $('d-top-n'), dBottomN: $('d-bottom-n'), dBotN: $('d-bot-n'),
+    dAxisMax: $('d-axis-max'), dAxisMin: $('d-axis-min'),
+    tierSummary: $('tier-summary'),
+    heatChart: $('heat-chart'), hNow: $('h-now'), hMax: $('h-max'), hReach: $('h-reach'),
+    hKeys: $('h-keys'), hNote: $('h-note'),
     cullLogBody: $('cull-log-body'),
     restCount: $('rest-count'), restPool: $('rest-pool'), flowGrid: $('flow-grid'),
     empty: $('empty'), emptyMsg: $('empty-msg'),
@@ -65,6 +96,10 @@
   let prevAlive = null;     // Map<storeId, {isBot}>
   let cullLog = [];
   let logMatchId = null;    // 履歴がどの試合のものか
+  // heat の履歴。**サーバーは履歴を持たない**（plan-h34 §1.2・h23「配信の状態は publisher が持つ」）。
+  // スナップショットが1〜2秒間隔で届くので、受信のたびにここへ積む。
+  let heatSeries = [];      // [{ms, heat}]
+  let heatObservedMax = 0;  // この試合で観測した heat の最大値（maxLevel に届いたかの判定）
   let ws = null, reconnectTimer = null, backoff = 1000, manualClose = false;
   let idleTimer = null;
 
@@ -140,6 +175,7 @@
   function onSnapshot(snap) {
     if (!snap || !Array.isArray(snap.stores)) return;
     trackCull(snap);
+    trackHeat(snap);
     lastSnapshot = snap;
     hideEmpty();
     armIdle();
@@ -158,6 +194,9 @@
       logMatchId = mid;
       cullLog = [];
       prevAlive = null;
+      // heat の履歴も試合単位（前の試合のカーブが次の試合に残ると誤診する）。
+      heatSeries = [];
+      heatObservedMax = 0;
       if (activeTab === 'dist') renderCullLog();
     }
 
@@ -181,6 +220,22 @@
     prevAlive = now;
   }
 
+  // ── heat の履歴（h34 §2.2）──
+  // サーバーに履歴を持たせない代わりに、受信したスナップショットをここへ積む。
+  // 試合は120秒・1〜2秒間隔なので、1試合あたり高々100点ほど。上限だけ念のため付ける。
+  const HEAT_MAX_POINTS = 2000;
+  function trackHeat(snap) {
+    if (snap.heatLevel == null) return;
+    const ms = Number(snap.elapsedMs) || 0;
+    const heat = Number(snap.heatLevel) || 0;
+    const last = heatSeries[heatSeries.length - 1];
+    // 同じ時刻の重複受信は上書き（配信が二重に来ても段が増えないように）。
+    if (last && ms <= last.ms) last.heat = heat;
+    else heatSeries.push({ ms, heat });
+    if (heatSeries.length > HEAT_MAX_POINTS) heatSeries.shift();
+    if (heat > heatObservedMax) heatObservedMax = heat;
+  }
+
   // ── メトリクス帯 ──
   function mixTotal(m) { return (m.normal || 0) + (m.bonus || 0) + (m.claimer || 0) + (m.buzz || 0); }
 
@@ -192,6 +247,9 @@
     el.mDead.textContent = dead;
     el.mPhase.textContent = phaseLabel(snap.phase);
     el.mHeat.textContent = snap.heatLevel != null ? snap.heatLevel : '–';
+    el.mHeatMax.textContent = snap.heatMaxLevel ? snap.heatMaxLevel : '?';
+    // 平均打鍵数（h30 の効果確認）。0 は「まだ客が配られていない」なので – と区別して出す。
+    el.mKeys.textContent = snap.avgKeystrokes != null ? snap.avgKeystrokes : '–';
     el.mRest.textContent = snap.restPool != null ? snap.restPool : '–';
     renderMix(el.mMix, snap.customers || {});
     // 本戦は全店が脱落して終わるので、進捗は「脱落数 / 全店」。
@@ -255,7 +313,12 @@
   function renderActive() {
     if (!lastSnapshot) return;
     if (activeTab === 'board') renderBoard(lastSnapshot);
-    else if (activeTab === 'dist') { renderDist(lastSnapshot); renderCullLog(); }
+    else if (activeTab === 'dist') {
+      renderTierSummary(lastSnapshot);
+      renderDist(lastSnapshot);
+      renderHeat(lastSnapshot);
+      renderCullLog();
+    }
     else renderFlow(lastSnapshot);
   }
 
@@ -299,6 +362,11 @@
     c.root.dataset.leader = String(alive && rank === 1);
     c.root.dataset.atrisk = String(!!s.atRisk);
     c.root.dataset.bot = String(!!s.isBot);
+    // tier（h34 §2.1）。人間は 'human' になり、CSS 側でハイライトされる（§3「人間を探させない」）。
+    const tier = tierOf(s);
+    c.root.dataset.tier = tier;
+    c.tierTag.textContent = TIER[tier].short;
+    c.tierTag.title = TIER[tier].label;
     c.rank.textContent = alive ? (rank > 0 ? '#' + rank : '–') : '✕';
     const fr = s.finalRank;
     c.finalBadge.textContent = (typeof fr === 'number') ? (fr + '位') : '脱落';
@@ -323,7 +391,7 @@
     const root = document.createElement('div');
     root.className = 'cell'; root.dataset.alive = 'true';
     root.innerHTML = `
-      <div class="cell-head"><span class="rank">–</span><span class="name"></span><span class="bot-tag" title="Bot（CPU補完）">BOT</span></div>
+      <div class="cell-head"><span class="rank">–</span><span class="name"></span><span class="tier-tag">–</span></div>
       <div class="score" data-sign="pos">0</div>
       <div class="cell-meta">
         <span class="tako"><span class="k">たこ</span> <b class="tako-val">0</b></span>
@@ -336,6 +404,7 @@
       <span class="final-badge">脱落</span>`;
     const c = {
       root, rank: root.querySelector('.rank'), name: root.querySelector('.name'),
+      tierTag: root.querySelector('.tier-tag'),
       score: root.querySelector('.score'),
       takoVal: root.querySelector('.tako-val'), missVal: root.querySelector('.miss-val'),
       queueWrap: root.querySelector('.queue'), queueVal: root.querySelector('.queue-val'),
@@ -379,13 +448,24 @@
   //   3. **Bot が上位を占めていないか**（P1）
   //
   // 凝ったグラフは要らない。順位順に並べた縦棒＋カットラインの横線で十分読める。
+  // 🔴 **軸は 0 を含む。** h31 で Bot が「1注文あたり固定時間」から「1打鍵あたり」になり、
+  //    弱 tier は終盤に**負スコア**へ回る（ミスの減点が提供を上回る）。
+  //    |score| で潰すと −85 と +85 が同じ高さに見え、「淘汰されているか」が読めない。
+  //    上下の伸び幅は正/負それぞれの最大値で自動スケールする（固定軸だと桁が変わるたびに死ぬ）。
   function renderDist(snap) {
     const stores = [...snap.stores];
     // 順位順（生存店は現在順位、脱落店はその後ろへ確定順位で）。
     stores.sort((a, b) => rankKeyOf(a) - rankKeyOf(b));
 
     const scores = stores.map(s => Number(s.score) || 0);
-    const max = Math.max(1, ...scores.map(Math.abs));
+    const maxPos = Math.max(0, ...scores);
+    const maxNeg = Math.max(0, ...scores.map(v => -v));
+    // 0 線の位置（下からの%）。負が無ければ最下部、正が無ければ最上部。
+    const span = maxPos + maxNeg;
+    const zeroPct = span > 0 ? (maxNeg / span) * 100 : 0;
+    el.zeroline.style.bottom = zeroPct.toFixed(2) + '%';
+    el.dAxisMax.textContent = maxPos > 0 ? fmtScore(maxPos) : '';
+    el.dAxisMin.textContent = maxNeg > 0 ? fmtScore(-maxNeg) : '';
 
     // 棒を差分更新する（毎tick作り直すと 99 要素の再生成で描画が重い）。
     const present = new Set();
@@ -395,18 +475,27 @@
       let b = bars.get(id) || createBar(id);
       const score = Number(s.score) || 0;
       const alive = !!s.alive;
-      // 高さは |score| / max。負値は下向きに描くと軸が要るので、ここでは
-      // 「0 は高さ0・負は赤で最小高」に潰して読みやすさを優先する。
-      const h = Math.max(2, Math.round((Math.abs(score) / max) * 100));
+      const tier = tierOf(s);
+      // 0 を基準に、正は上へ・負は下へ伸ばす。0 ちょうどでも 1.5% は描いて存在を示す。
+      let h, bottom;
+      if (score >= 0) {
+        h = maxPos > 0 ? (score / maxPos) * (100 - zeroPct) : 0;
+        h = Math.max(h, 1.5);
+        bottom = zeroPct;
+      } else {
+        h = maxNeg > 0 ? (-score / maxNeg) * zeroPct : 0;
+        h = Math.max(h, 1.5);
+        bottom = zeroPct - h;
+      }
       b.root.style.order = i;
-      b.root.style.height = h + '%';
+      b.fill.style.height = h.toFixed(2) + '%';
+      b.fill.style.bottom = bottom.toFixed(2) + '%';
       b.root.dataset.alive = String(alive);
-      b.root.dataset.bot = String(!!s.isBot);
+      b.root.dataset.tier = tier;
       b.root.dataset.cut = String(!!s.atRisk);
       b.root.dataset.neg = String(score < 0);
       b.root.title = `${s.displayName || id}\n順位 ${alive ? (s.rank || '–') : (s.finalRank || '–') + '（確定）'}\n` +
-        `スコア ${fmtScore(score)}\nたこ焼き ${s.takoyakiCount || 0} / ミス ${s.missCount || 0}` +
-        (s.isBot ? '\nBot' : '');
+        `スコア ${fmtScore(score)}\nたこ焼き ${s.takoyakiCount || 0} / ミス ${s.missCount || 0}\n${TIER[tier].label}`;
       bars.set(id, b);
     });
     for (const [id, b] of bars) { if (!present.has(id)) { b.root.remove(); bars.delete(id); } }
@@ -414,6 +503,42 @@
     renderCutline(snap, stores);
     renderDistStats(stores);
   }
+
+  // tier 別の集計（h34 §3）。99行を目で拾うのは無理なので、平均値1行で傾向を見る。
+  //
+  //   強が上位を独占していないか → 強の平均だけ突出していないか
+  //   人間が真ん中に混ざっているか → 人間の順位（最重要指標）
+  //   弱が早期に落ちているか      → 弱の生存数が足切りのたびに減るか
+  function renderTierSummary(snap) {
+    const groups = new Map(TIER_ORDER.map(t => [t, []]));
+    for (const s of snap.stores) groups.get(tierOf(s)).push(s);
+
+    const cards = [];
+    for (const t of TIER_ORDER) {
+      const all = groups.get(t);
+      if (all.length === 0) continue; // 居ない tier は出さない（人間0の sim でも邪魔にならない）
+      const alive = all.filter(s => s.alive);
+      const avg = alive.length
+        ? Math.round(alive.reduce((a, s) => a + (Number(s.score) || 0), 0) / alive.length)
+        : null;
+      // 人間は順位そのものを出す（「人間が何位か」を探させない）。
+      let ranks = '';
+      if (t === 'human' && alive.length > 0 && alive.length <= 8) {
+        ranks = alive.map(s => '#' + (Number(s.rank) || 0)).sort(cmpRankTag).join(' ');
+      }
+      cards.push(
+        `<div class="tier-card" data-tier="${t}">` +
+        `<span class="tier-card-name">${TIER[t].label}</span>` +
+        `<span class="tier-card-alive">生存 <b>${alive.length}</b><span class="metric-sub">/${all.length}</span></span>` +
+        `<span class="tier-card-avg">平均 <b>${avg == null ? '–' : fmtScore(avg)}</b></span>` +
+        (ranks ? `<span class="tier-card-ranks">${ranks}</span>` : '') +
+        `</div>`
+      );
+    }
+    el.tierSummary.innerHTML = cards.join('');
+  }
+
+  function cmpRankTag(a, b) { return parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10); }
 
   function rankKeyOf(s) {
     if (s.alive) return Number(s.rank) || 9999;
@@ -423,8 +548,11 @@
   function createBar(id) {
     const root = document.createElement('i');
     root.className = 'dist-bar';
+    const fill = document.createElement('b');
+    fill.className = 'dist-fill';
+    root.appendChild(fill);
     el.distBars.appendChild(root);
-    const b = { root };
+    const b = { root, fill };
     bars.set(id, b);
     return b;
   }
@@ -467,6 +595,93 @@
     el.dBotShare.textContent = botsInTop + '/' + n;
     el.dBotN.textContent = n;
     el.dBotShare.dataset.warn = String(botsInTop > n / 2);
+  }
+
+  // ══ 火力（heat）カーブ（h34 §2.2）══
+  //
+  // 🔴 **maxLevel の水平線を必ず引く。** 「heat が上端に届かない」問題は
+  //    #75 → h26 §1.2 → h32 と3度再発している。届いたかどうかが目で見えれば4度目は起きない。
+  //    そのために y 軸の上端は maxLevel より少し上（15%）に取り、上限線を**枠線と別物に見せる**。
+  //    上端＝maxLevel にすると「線が枠と重なって届いたように見える」という別の誤読を生む。
+  const HEAT_W = 1000, HEAT_H = 240;
+  const HEAT_PAD = { l: 46, r: 104, t: 16, b: 26 }; // r は "maxLevel 17" のラベルが収まる幅
+
+  function renderHeat(snap) {
+    const maxLevel = Number(snap.heatMaxLevel) || 0;
+    el.hNow.textContent = snap.heatLevel != null ? snap.heatLevel : '–';
+    el.hMax.textContent = maxLevel || '不明';
+    el.hKeys.textContent = snap.avgKeystrokes != null ? snap.avgKeystrokes : '–';
+
+    if (maxLevel > 0) {
+      const reached = heatObservedMax >= maxLevel;
+      el.hReach.textContent = heatObservedMax + '/' + maxLevel + (reached ? '（到達）' : '（未到達）');
+      el.hReach.dataset.warn = String(!reached);
+      el.hNote.hidden = true;
+    } else {
+      el.hReach.textContent = String(heatObservedMax || '–');
+      el.hReach.dataset.warn = 'false';
+      // 上限が届いていないのに勝手な線を引くと「上端に届いた」の誤読を生むので、引かない。
+      el.hNote.textContent = 'サーバーが heatMaxLevel を配っていないため上限線は引けません（Server 側 h34 §1.2 が未反映）';
+      el.hNote.hidden = false;
+    }
+
+    if (heatSeries.length === 0) {
+      el.heatChart.innerHTML = '<div class="heat-empty">受信待ち…</div>';
+      return;
+    }
+
+    const { l, r, t, b } = HEAT_PAD;
+    const plotW = HEAT_W - l - r, plotH = HEAT_H - t - b;
+    // y 上端: 上限線が枠に貼り付かないように 15% の余白を足す。観測値が上限を超えたらそちらに合わせる。
+    const yTop = Math.max(1, Math.ceil(Math.max(maxLevel, heatObservedMax, 1) * 1.15));
+    const lastMs = heatSeries[heatSeries.length - 1].ms;
+    const xMax = Math.max(60000, Math.ceil(lastMs / 10000) * 10000);
+    const X = (ms) => l + (Math.min(ms, xMax) / xMax) * plotW;
+    const Y = (v) => t + (1 - Math.min(v, yTop) / yTop) * plotH;
+
+    const parts = [];
+    parts.push(`<rect x="${l}" y="${t}" width="${plotW}" height="${plotH}" class="hc-plot"/>`);
+
+    // x 目盛（20秒ごと）
+    for (let ms = 0; ms <= xMax; ms += 20000) {
+      const x = X(ms).toFixed(1);
+      parts.push(`<line x1="${x}" y1="${t}" x2="${x}" y2="${t + plotH}" class="hc-grid"/>`);
+      parts.push(`<text x="${x}" y="${t + plotH + 18}" class="hc-xlab">${ms / 1000}s</text>`);
+    }
+    // y 目盛（0 と上端）
+    for (const v of [0, yTop]) {
+      const y = Y(v).toFixed(1);
+      parts.push(`<line x1="${l}" y1="${y}" x2="${l + plotW}" y2="${y}" class="hc-grid"/>`);
+      parts.push(`<text x="${l - 8}" y="${(+y + 4).toFixed(1)}" class="hc-ylab">${v}</text>`);
+    }
+
+    // 足切りの縦線（段差がどこで起きたか）。履歴はダッシュボード側で組んだもの。
+    for (const c of cullLog) {
+      const x = X(c.atMs).toFixed(1);
+      parts.push(`<line x1="${x}" y1="${t}" x2="${x}" y2="${t + plotH}" class="hc-cull"/>`);
+      parts.push(`<text x="${x}" y="${t + 12}" class="hc-culllab">✂${c.stage}</text>`);
+    }
+
+    // 🔴 上限線（本 plan の主目的のひとつ）
+    if (maxLevel > 0) {
+      const y = Y(maxLevel).toFixed(1);
+      parts.push(`<line x1="${l}" y1="${y}" x2="${l + plotW}" y2="${y}" class="hc-max"/>`);
+      parts.push(`<text x="${l + plotW + 6}" y="${(+y + 4).toFixed(1)}" class="hc-maxlab">maxLevel ${maxLevel}</text>`);
+    }
+
+    // heat は整数で段階的に上がるので階段で描く（直線で結ぶと「なめらかに上がった」と誤読する）。
+    let d = `M ${X(heatSeries[0].ms).toFixed(1)} ${Y(heatSeries[0].heat).toFixed(1)}`;
+    for (let i = 1; i < heatSeries.length; i++) {
+      const p = heatSeries[i], q = heatSeries[i - 1];
+      d += ` L ${X(p.ms).toFixed(1)} ${Y(q.heat).toFixed(1)} L ${X(p.ms).toFixed(1)} ${Y(p.heat).toFixed(1)}`;
+    }
+    parts.push(`<path d="${d}" class="hc-line"/>`);
+
+    const last = heatSeries[heatSeries.length - 1];
+    parts.push(`<circle cx="${X(last.ms).toFixed(1)}" cy="${Y(last.heat).toFixed(1)}" r="3.5" class="hc-dot"/>`);
+
+    el.heatChart.innerHTML =
+      `<svg viewBox="0 0 ${HEAT_W} ${HEAT_H}" class="hc" role="img">${parts.join('')}</svg>`;
   }
 
   function renderCullLog() {

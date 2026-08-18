@@ -55,7 +55,11 @@
     </div>
     <div class="metric">
       <span class="metric-label">火力 Lv</span>
-      <span class="metric-value metric-value--md" id="m-heat">–</span>
+      <span class="metric-value metric-value--md"><span id="m-heat">–</span><span class="metric-sub">/<span id="m-heat-max">–</span></span></span>
+    </div>
+    <div class="metric" title="今どこかの行列に並んでいる客1人あたりの平均打鍵数（plan-h30 の効果確認）">
+      <span class="metric-label">平均打鍵</span>
+      <span class="metric-value metric-value--md" id="m-keys">–</span>
     </div>
     <div class="metric">
       <span class="metric-label">待機客</span>
@@ -100,11 +104,16 @@
       <div id="grid" class="grid" aria-label="99店のライブ状態"></div>
     </section>
 
-    <!-- タブ2: スコア分布（h25 の主目的。h26 のバランス調整の計測器） -->
+    <!-- タブ2: スコア分布（h25 の主目的。h26 のバランス調整の計測器）＋ tier 集計・heat カーブ（h34） -->
     <section class="view" id="view-dist" hidden>
+      <!-- tier 別の集計（h34 §3）。99行を目で拾わずに傾向を掴むための1行。 -->
+      <div class="tier-summary" id="tier-summary"></div>
+
       <div class="dist-legend">
         <span class="dist-key"><i class="sw sw--human"></i>人間</span>
-        <span class="dist-key"><i class="sw sw--bot"></i>Bot</span>
+        <span class="dist-key"><i class="sw sw--strong"></i>強Bot</span>
+        <span class="dist-key"><i class="sw sw--normal"></i>中Bot</span>
+        <span class="dist-key"><i class="sw sw--weak"></i>弱Bot</span>
         <span class="dist-key"><i class="sw sw--dead"></i>脱落済み</span>
         <span class="dist-key"><i class="sw sw--cut"></i>次に切られる</span>
         <span class="dist-stat">上位<b id="d-top-n">10</b>平均 <b id="d-top">–</b></span>
@@ -112,9 +121,26 @@
         <span class="dist-stat">分離度 <b id="d-sep" title="上位平均 − 下位平均。小さいほど団子＝足切りがタイブレーク頼みになる">–</b></span>
         <span class="dist-stat">Bot が上位<b id="d-bot-n">10</b>に <b id="d-botshare">–</b></span>
       </div>
+      <!-- スコアは 0 でクランプしないので負値が出る（h31 で弱 tier は終盤に負へ回る）。
+           0 の基準線を引き、負は下向きに描く。 -->
       <div class="dist-chart" id="dist-chart" aria-label="スコア分布（順位順）">
         <div class="cutline" id="cutline" hidden><span class="cutline-tag">カットライン</span></div>
+        <div class="zeroline" id="zeroline"><span class="zeroline-tag">0</span></div>
+        <span class="axis-tag axis-tag--top" id="d-axis-max">–</span>
+        <span class="axis-tag axis-tag--bottom" id="d-axis-min">–</span>
         <div class="dist-bars" id="dist-bars"></div>
+      </div>
+
+      <!-- heat カーブ（h34 §2.2）。maxLevel の水平線が本 plan の主目的のひとつ。 -->
+      <div class="heat-panel">
+        <div class="heat-head">
+          <span class="heat-title">火力（heat）カーブ</span>
+          <span class="dist-stat">現在 <b id="h-now">–</b> / 上限 <b id="h-max">–</b></span>
+          <span class="dist-stat">到達 <b id="h-reach" title="観測した heat の最大値が maxLevel に届いたか">–</b></span>
+          <span class="dist-stat">平均打鍵 <b id="h-keys">–</b></span>
+          <span class="heat-note" id="h-note" hidden></span>
+        </div>
+        <div class="heat-chart" id="heat-chart" aria-label="火力カーブ（時系列）"></div>
       </div>
       <div class="cull-log">
         <div class="cull-log-head">足切りの履歴</div>
